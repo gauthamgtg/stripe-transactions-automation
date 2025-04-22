@@ -1182,7 +1182,7 @@ def sync_payment_intents():
 
 # Sync charges from Stripe to PostgreSQL
 def sync_charges():
-    print("Syncing charges...")
+    logger.info("Starting charges sync...")
     conn = get_db_connection()
     cursor = conn.cursor()
     
@@ -1190,26 +1190,24 @@ def sync_charges():
         # Get current count before sync
         cursor.execute("SELECT COUNT(*) FROM charges")
         initial_count = cursor.fetchone()[0]
-        print(f"Current records in database: {initial_count}")
+        logger.info(f"Current records in database: {initial_count}")
         
         # Get the latest created timestamp from the database
         cursor.execute("SELECT MAX(created) FROM charges")
         last_created = cursor.fetchone()[0]
         
-        params = {'limit': 100, 'expand': ['data.payment_intent']}  # Expand payment_intent to get full details
+        params = {'limit': 100}
         if last_created:
-            # Convert datetime to Unix timestamp
             last_created_timestamp = int(last_created.timestamp())
-            print(f"Fetching charges created after: {last_created} (timestamp: {last_created_timestamp})")
+            logger.info(f"Fetching charges created after: {last_created} (timestamp: {last_created_timestamp})")
             params['created'] = {'gt': last_created_timestamp}
         else:
-            print("No existing records found, fetching all charges")
+            logger.info("No existing records found, fetching all charges")
         
         has_more = True
         starting_after = None
         total_count = 0
         page_count = 0
-        payment_intents_added = 0
         new_records = 0
         updated_records = 0
         failed_records = 0
@@ -1218,18 +1216,36 @@ def sync_charges():
             try:
                 if starting_after:
                     params['starting_after'] = starting_after
-                    
-                print(f"Fetching page {page_count + 1} with params: {params}")
+                
+                # Start a new transaction for this page
+                cursor.execute("BEGIN")
+                
+                logger.info(f"Fetching page {page_count + 1} with params: {params}")
                 charges = stripe.Charge.list(**params)
                 page_count += 1
                 count = 0
+                page_new = 0
+                page_updated = 0
+                page_failed = 0
                 
                 if not charges.data:
-                    print(f"No charges found in page {page_count}")
+                    logger.info(f"No charges found in page {page_count}")
                     break
+                
+                logger.info(f"Retrieved {len(charges.data)} charges from Stripe")
+                
+                # Process charges in batches
+                batch_size = 50
+                charge_batch = []
                 
                 for charge in charges.auto_paging_iter():
                     try:
+                        # Validate required fields
+                        if not all([hasattr(charge, attr) for attr in ['id', 'amount', 'currency', 'status', 'created']]):
+                            logger.warning(f"Skipping charge {charge.id} due to missing required fields")
+                            page_failed += 1
+                            continue
+                            
                         created_date = datetime.datetime.fromtimestamp(charge.created)
                         customer_id = charge.customer if hasattr(charge, 'customer') else None
                         payment_intent_id = charge.payment_intent if hasattr(charge, 'payment_intent') else None
@@ -1237,56 +1253,6 @@ def sync_charges():
                         # Check if record exists
                         cursor.execute("SELECT id FROM charges WHERE id = %s", (charge.id,))
                         exists = cursor.fetchone() is not None
-                        
-                        # If there's a payment_intent_id, ensure it exists in our database
-                        if payment_intent_id:
-                            cursor.execute(
-                                "SELECT id FROM payment_intents WHERE id = %s",
-                                (payment_intent_id,)
-                            )
-                            if not cursor.fetchone():
-                                # Fetch the payment intent from Stripe
-                                try:
-                                    payment_intent = stripe.PaymentIntent.retrieve(payment_intent_id)
-                                    created_date = datetime.datetime.fromtimestamp(payment_intent.created)
-                                    customer_id = payment_intent.customer if hasattr(payment_intent, 'customer') else None
-                                    
-                                    # Prepare payment intent data
-                                    pi_data = {
-                                        'id': payment_intent.id,
-                                        'amount': payment_intent.amount,
-                                        'status': payment_intent.status,
-                                        'created': created_date,
-                                        'currency': payment_intent.currency,
-                                        'customer': customer_id,
-                                        'livemode': payment_intent.livemode,
-                                        'metadata': payment_intent.metadata,
-                                        'client_secret': payment_intent.client_secret,
-                                        'data': payment_intent
-                                    }
-                                    
-                                    # Convert JSON fields
-                                    for field in ['metadata', 'data']:
-                                        if pi_data[field] is not None:
-                                            pi_data[field] = psycopg2.extras.Json(pi_data[field])
-                                    
-                                    # Build the SQL query
-                                    columns = ', '.join(pi_data.keys())
-                                    values = ', '.join(['%s'] * len(pi_data))
-                                    update_clause = ', '.join([f"{k} = EXCLUDED.{k}" for k in pi_data.keys()])
-                                    
-                                    query = f"""
-                                        INSERT INTO payment_intents ({columns})
-                                        VALUES ({values})
-                                        ON CONFLICT (id) DO UPDATE SET {update_clause}
-                                    """
-                                    
-                                    cursor.execute(query, list(pi_data.values()))
-                                    payment_intents_added += 1
-                                    conn.commit()
-                                except stripe.error.InvalidRequestError as e:
-                                    print(f"Error fetching payment intent {payment_intent_id}: {str(e)}")
-                                    continue
                         
                         # Prepare charge data
                         charge_data = {
@@ -1306,74 +1272,122 @@ def sync_charges():
                             if charge_data[field] is not None:
                                 charge_data[field] = psycopg2.extras.Json(charge_data[field])
                         
-                        # Build the SQL query
-                        columns = ', '.join(charge_data.keys())
-                        values = ', '.join(['%s'] * len(charge_data))
-                        update_clause = ', '.join([f"{k} = EXCLUDED.{k}" for k in charge_data.keys()])
-                        
-                        query = f"""
-                            INSERT INTO charges ({columns})
-                            VALUES ({values})
-                            ON CONFLICT (id) DO UPDATE SET {update_clause}
-                        """
-                        
-                        cursor.execute(query, list(charge_data.values()))
-                        conn.commit()  # Commit after each charge
+                        charge_batch.append(charge_data)
                         
                         if exists:
-                            updated_records += 1
+                            page_updated += 1
                         else:
-                            new_records += 1
+                            page_new += 1
                             
                         count += 1
-                        total_count += 1
                         
+                        # Process batch when it reaches batch_size
+                        if len(charge_batch) >= batch_size:
+                            logger.info(f"Processing batch of {len(charge_batch)} charges")
+                            process_charge_batch(cursor, charge_batch)
+                            charge_batch = []
+                            logger.info("Batch processed successfully")
+                            
                     except Exception as e:
-                        print(f"Error processing charge {charge.id}: {str(e)}")
-                        failed_records += 1
-                        conn.rollback()
+                        logger.error(f"Error processing charge {charge.id}: {str(e)}")
+                        page_failed += 1
                         continue
                 
-                # Commit after each page
-                conn.commit()
-                print(f"Page {page_count}: Processed {count} charges (New: {new_records}, Updated: {updated_records}, Failed: {failed_records}, Added PIs: {payment_intents_added})")
+                # Process remaining charges in the batch
+                if charge_batch:
+                    logger.info(f"Processing final batch of {len(charge_batch)} charges")
+                    process_charge_batch(cursor, charge_batch)
+                    logger.info("Final batch processed successfully")
+                
+                # Commit the page transaction
+                cursor.execute("COMMIT")
+                logger.info(f"Committed page {page_count} changes to database")
+                
+                # Update running totals
+                total_count += count
+                new_records += page_new
+                updated_records += page_updated
+                failed_records += page_failed
+                
+                # Update last sync timestamp after each successful page
+                update_last_sync('charges')
+                logger.info(f"Updated sync timestamp for charges")
+                
+                logger.info(f"Page {page_count} Summary:")
+                logger.info(f"Processed: {count} charges")
+                logger.info(f"New: {page_new}")
+                logger.info(f"Updated: {page_updated}")
+                logger.info(f"Failed: {page_failed}")
+                logger.info(f"Running Total: {total_count}")
                 
                 has_more = charges.has_more
                 if has_more and len(charges.data) > 0:
                     starting_after = charges.data[-1].id
+                    logger.info(f"More pages available, continuing with starting_after: {starting_after}")
                 else:
                     has_more = False
-                    
-                # Update last sync timestamp after each successful page
-                update_last_sync('charges')
+                    logger.info("No more pages available")
                 
             except Exception as e:
-                print(f"Error processing page {page_count}: {str(e)}")
-                conn.rollback()
-                raise
+                logger.error(f"Error processing page {page_count}: {str(e)}")
+                cursor.execute("ROLLBACK")
+                # Continue with next page even if this one failed
+                continue
         
         # Get final count
         cursor.execute("SELECT COUNT(*) FROM charges")
         final_count = cursor.fetchone()[0]
         
-        print("\nCharges Sync Summary:")
-        print(f"Total pages processed: {page_count}")
-        print(f"Total records processed: {total_count}")
-        print(f"New records added: {new_records}")
-        print(f"Records updated: {updated_records}")
-        print(f"Records failed: {failed_records}")
-        print(f"Payment intents added: {payment_intents_added}")
-        print(f"Initial database count: {initial_count}")
-        print(f"Final database count: {final_count}")
-        print(f"Net change in database: {final_count - initial_count}")
+        logger.info("\nCharges Sync Summary:")
+        logger.info(f"Total pages processed: {page_count}")
+        logger.info(f"Total records processed: {total_count}")
+        logger.info(f"New records added: {new_records}")
+        logger.info(f"Records updated: {updated_records}")
+        logger.info(f"Records failed: {failed_records}")
+        logger.info(f"Initial database count: {initial_count}")
+        logger.info(f"Final database count: {final_count}")
+        logger.info(f"Net change in database: {final_count - initial_count}")
         
     except Exception as e:
-        print(f"Error in sync_charges: {str(e)}")
-        conn.rollback()
+        logger.error(f"Error in sync_charges: {str(e)}")
+        cursor.execute("ROLLBACK")
         raise
     finally:
         cursor.close()
         conn.close()
+        logger.info("Charges sync completed")
+
+def process_charge_batch(cursor, charge_batch):
+    """
+    Process a batch of charges in a single transaction
+    """
+    try:
+        # Start a new transaction for the batch
+        cursor.execute("BEGIN")
+        
+        for charge_data in charge_batch:
+            # Build the SQL query
+            columns = ', '.join(charge_data.keys())
+            values = ', '.join(['%s'] * len(charge_data))
+            update_clause = ', '.join([f"{k} = EXCLUDED.{k}" for k in charge_data.keys()])
+            
+            query = f"""
+                INSERT INTO charges ({columns})
+                VALUES ({values})
+                ON CONFLICT (id) DO UPDATE SET {update_clause}
+            """
+            
+            cursor.execute(query, list(charge_data.values()))
+        
+        # Commit the batch transaction
+        cursor.execute("COMMIT")
+        logger.info(f"Successfully committed batch of {len(charge_batch)} charges to database")
+        
+    except Exception as e:
+        # Rollback the transaction on error
+        cursor.execute("ROLLBACK")
+        logger.error(f"Error processing charge batch: {str(e)}")
+        raise
 
 # Sync payment methods from Stripe to PostgreSQL
 def sync_payment_methods():
